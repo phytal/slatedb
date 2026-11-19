@@ -184,6 +184,12 @@ impl CacheFetch {
 /// ```
 #[async_trait]
 pub trait DbCache: Send + Sync {
+    /// Return an entry from memory without I/O. Return `None` to use the normal fetch path.
+    /// A miss here must not count as a cache miss: the fetch records the outcome.
+    fn get_resident(&self, _kind: CacheEntryKind, _key: &CachedKey) -> Option<CachedEntry> {
+        None
+    }
+
     async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error>;
     async fn get_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error>;
     async fn get_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error>;
@@ -288,6 +294,35 @@ pub trait DbCache: Send + Sync {
         let entry = loader().await?;
         self.insert(key, entry.clone()).await;
         Ok(CacheFetch::miss(entry))
+    }
+}
+
+/// The SST component requested from a [`DbCache`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheEntryKind {
+    Data,
+    Index,
+    Filter,
+    Stats,
+}
+
+impl dyn DbCache + '_ {
+    pub(crate) async fn fetch_with(
+        &self,
+        kind: CacheEntryKind,
+        key: CachedKey,
+        make_loader: impl FnOnce() -> CacheLoader,
+    ) -> Result<CacheFetch, crate::Error> {
+        if let Some(entry) = self.get_resident(kind, &key) {
+            return Ok(CacheFetch::hit(entry));
+        }
+        let loader = make_loader();
+        match kind {
+            CacheEntryKind::Data => self.fetch_block(key, loader).await,
+            CacheEntryKind::Index => self.fetch_index(key, loader).await,
+            CacheEntryKind::Filter => self.fetch_filter(key, loader).await,
+            CacheEntryKind::Stats => self.fetch_stats(key, loader).await,
+        }
     }
 }
 
@@ -560,6 +595,16 @@ impl Default for SplitCache {
 
 #[async_trait]
 impl DbCache for SplitCache {
+    fn get_resident(&self, kind: CacheEntryKind, key: &CachedKey) -> Option<CachedEntry> {
+        let cache = match kind {
+            CacheEntryKind::Data => self.block_cache.as_ref(),
+            CacheEntryKind::Index | CacheEntryKind::Filter | CacheEntryKind::Stats => {
+                self.meta_cache.as_ref()
+            }
+        }?;
+        cache.get_resident(kind, key)
+    }
+
     async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
         if let Some(cache) = &self.block_cache {
             cache.get_block(key).await
@@ -831,6 +876,17 @@ impl DbCacheWrapper {
 
 #[async_trait]
 impl DbCache for DbCacheWrapper {
+    fn get_resident(&self, kind: CacheEntryKind, key: &CachedKey) -> Option<CachedEntry> {
+        let entry = self.cache.get_resident(kind, &self.scoped_key(key))?;
+        match kind {
+            CacheEntryKind::Data => self.stats.data_block_hit.increment(1),
+            CacheEntryKind::Index => self.stats.index_hit.increment(1),
+            CacheEntryKind::Filter => self.stats.filter_hit.increment(1),
+            CacheEntryKind::Stats => self.stats.stats_hit.increment(1),
+        };
+        Some(entry)
+    }
+
     async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
         let scoped_key = self.scoped_key(key);
         let entry = match self.cache.get_block(&scoped_key).await {
@@ -989,6 +1045,10 @@ impl UnownedDbCache {
 
 #[async_trait]
 impl DbCache for UnownedDbCache {
+    fn get_resident(&self, kind: CacheEntryKind, key: &CachedKey) -> Option<CachedEntry> {
+        self.inner.get_resident(kind, key)
+    }
+
     async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
         self.inner.get_block(key).await
     }

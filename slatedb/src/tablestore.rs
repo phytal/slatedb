@@ -17,7 +17,7 @@ use ulid::Ulid;
 
 use crate::block_cache_policy::{should_cache_data_block, BlockCachePolicy};
 use crate::bytes_range::BytesRange;
-use crate::db_cache::{CacheFetch, CacheLookup, CacheTarget};
+use crate::db_cache::{CacheEntryKind, CacheFetch, CacheLookup, CacheTarget};
 use crate::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache, EncodedCachedFilter};
 use crate::db_state::{SsTableHandle, SsTableId, SstType};
 use crate::error::SlateDBError;
@@ -42,9 +42,6 @@ use tracing::Instrument;
 
 pub(crate) struct TableStore {
     object_store: Arc<dyn ObjectStore>,
-    // `sst_format` and `path_resolver` are behind `Arc`s so that building a
-    // cache-miss loader on every cached read is a few refcount bumps rather than
-    // a deep clone plus path formatting.
     sst_format: Arc<SsTableFormat>,
     path_resolver: Arc<PathResolver>,
     #[allow(dead_code)]
@@ -444,10 +441,9 @@ impl TableStore {
             // and on the rare foyer-machinery error an insert would likely fail too.
             let fetch = if cache_blocks {
                 cache
-                    .fetch_filter(
-                        cache_key.clone(),
-                        self.read_loader(handle, CacheTarget::Filters, segment.clone()),
-                    )
+                    .fetch_with(CacheEntryKind::Filter, cache_key.clone(), || {
+                        self.read_loader(handle, CacheTarget::Filters, segment.clone())
+                    })
                     .await
                     .ok()
             } else {
@@ -504,10 +500,9 @@ impl TableStore {
             // See `read_filters` for the rationale on the fall-through path.
             let entry = if cache_blocks {
                 cache
-                    .fetch_stats(
-                        cache_key,
-                        self.read_loader(handle, CacheTarget::Stats, segment.clone()),
-                    )
+                    .fetch_with(CacheEntryKind::Stats, cache_key, || {
+                        self.read_loader(handle, CacheTarget::Stats, segment.clone())
+                    })
                     .await
                     .ok()
                     .map(|fetch| fetch.entry)
@@ -561,10 +556,9 @@ impl TableStore {
             // See `read_filters` for the rationale on the fall-through path.
             let fetch = if cache_blocks {
                 cache
-                    .fetch_index(
-                        cache_key,
-                        self.read_loader(handle, CacheTarget::Index, segment.clone()),
-                    )
+                    .fetch_with(CacheEntryKind::Index, cache_key, || {
+                        self.read_loader(handle, CacheTarget::Index, segment.clone())
+                    })
                     .await
                     .ok()
             } else {
@@ -596,9 +590,7 @@ impl TableStore {
     /// or index). Panics on [`CacheTarget::Data`]: data blocks resolve through
     /// [`Self::block_loader`] because they require a block index lookup.
     ///
-    /// Called on every cached read, including hits where the loader never runs,
-    /// so it only captures cheap handles; the SST path is resolved inside the
-    /// loader.
+    /// Resolve the SST path only if this caller runs the loader.
     fn read_loader(
         &self,
         handle: &SsTableHandle,
@@ -658,8 +650,7 @@ impl TableStore {
         })
     }
 
-    /// Like [`Self::read_loader`], this runs on every cached block read, so it
-    /// only captures cheap handles and resolves the SST path inside the loader.
+    /// Build the loader for one data block.
     fn block_loader(
         &self,
         handle: &SsTableHandle,
@@ -834,8 +825,12 @@ impl TableStore {
                 let block_num = blocks.start;
                 let offset = index.borrow().block_meta().get(block_num).offset();
                 let cache_key: CachedKey = (handle.id, offset).into();
-                let loader = self.block_loader(handle, index.clone(), block_num, segment.clone());
-                if let Ok(fetch) = cache.fetch_block(cache_key, loader).await {
+                if let Ok(fetch) = cache
+                    .fetch_with(CacheEntryKind::Data, cache_key, || {
+                        self.block_loader(handle, index.clone(), block_num, segment.clone())
+                    })
+                    .await
+                {
                     if let Some(block) = fetch.entry.block() {
                         let (cache_hits, cache_misses) = match fetch.lookup {
                             CacheLookup::Hit => (1, 0),

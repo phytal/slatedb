@@ -72,7 +72,8 @@
 
 use crate::{
     db_cache::{
-        instrumented_loader, CacheFetch, CacheLoader, CacheLookup, CachedEntry, CachedKey, DbCache,
+        instrumented_loader, CacheEntryKind, CacheFetch, CacheLoader, CacheLookup, CachedEntry,
+        CachedKey, DbCache,
     },
     error::SlateDBError,
     utils::format_bytes_si,
@@ -103,6 +104,13 @@ impl FoyerHybridCache {
 
 #[async_trait]
 impl DbCache for FoyerHybridCache {
+    fn get_resident(&self, _kind: CacheEntryKind, key: &CachedKey) -> Option<CachedEntry> {
+        self.inner
+            .memory()
+            .get(key)
+            .map(|entry| entry.value().clone())
+    }
+
     async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
         self.get(key).await
     }
@@ -293,7 +301,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_lookup_from_memory_and_disk() {
-        use crate::db_cache::{CacheLoader, CacheLookup};
+        use crate::db_cache::{CacheEntryKind, CacheLoader, CacheLookup};
 
         let (cache, _tempdir) = setup().await;
         let key = CachedKey::from((SsTableId::new(Ulid::new()), 0));
@@ -303,8 +311,11 @@ mod tests {
         let second = cache.fetch_block(key.clone(), loader()).await.unwrap();
         assert_eq!(second.lookup, CacheLookup::Hit);
         cache.flush_scope(0).await.unwrap();
-        assert!(cache.inner.memory().get(&key).is_none());
-        let third = cache.fetch_block(key, loader()).await.unwrap();
+        assert!(cache.get_resident(CacheEntryKind::Data, &key).is_none());
+        let third = (&cache as &dyn DbCache)
+            .fetch_with(CacheEntryKind::Data, key, loader)
+            .await
+            .unwrap();
         assert_eq!(third.lookup, CacheLookup::Hit);
         assert_eq!(third.entry.size(), first.entry.size());
         cache.close().await.unwrap();
