@@ -32,8 +32,8 @@
 //!
 
 use crate::db_cache::{
-    instrumented_loader, CacheFetch, CacheLoader, CacheLookup, CachedEntry, CachedKey, DbCache,
-    DEFAULT_MAX_CAPACITY,
+    instrumented_loader, CacheEntryKind, CacheFetch, CacheLoader, CacheLookup, CachedEntry,
+    CachedKey, DbCache, DEFAULT_MAX_CAPACITY,
 };
 use crate::error::SlateDBError;
 use async_trait::async_trait;
@@ -125,6 +125,10 @@ impl Default for FoyerCache {
 
 #[async_trait]
 impl DbCache for FoyerCache {
+    fn get_resident(&self, _kind: CacheEntryKind, key: &CachedKey) -> Option<CachedEntry> {
+        self.inner.get(key).map(|entry| entry.value().clone())
+    }
+
     async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
         Ok(self.inner.get(key).map(|entry| entry.value().clone()))
     }
@@ -275,6 +279,57 @@ mod tests {
             CachedEntry::with_filters(&sst.filters),
             CachedEntry::with_sst_stats(Arc::new(SstStats::default())),
         ]
+    }
+
+    #[tokio::test]
+    async fn resident_reads_skip_the_loader_and_count_one_hit() {
+        use crate::db_cache::{DbCacheWrapper, SplitCache, UnownedDbCache};
+        use slatedb_common::clock::DefaultSystemClock;
+        use slatedb_common::metrics::{
+            lookup_metric_with_labels, DefaultMetricsRecorder, MetricLevel, MetricsRecorderHelper,
+        };
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let split = SplitCache::new()
+            .with_block_cache(Some(Arc::new(FoyerCache::new())))
+            .with_meta_cache(Some(Arc::new(FoyerCache::new())));
+        let cache: &dyn DbCache = &DbCacheWrapper::new(
+            Arc::new(UnownedDbCache::new(Arc::new(split))),
+            &MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default()),
+            Arc::new(DefaultSystemClock::default()),
+            1,
+        );
+        let kinds = [
+            (CacheEntryKind::Data, "data_block"),
+            (CacheEntryKind::Index, "index"),
+            (CacheEntryKind::Filter, "filter"),
+            (CacheEntryKind::Stats, "stats"),
+        ];
+        for (i, (entry, (kind, label))) in entries().await.into_iter().zip(kinds).enumerate() {
+            let key = key(i as u64);
+            let cold = cache
+                .fetch_with(kind, key.clone(), || {
+                    Box::new(move || Box::pin(async move { Ok(entry) }))
+                })
+                .await
+                .unwrap();
+            assert_eq!(cold.lookup, CacheLookup::Miss);
+            let warm = cache
+                .fetch_with(kind, key, || panic!("constructed a loader on a hit"))
+                .await
+                .unwrap();
+            assert_eq!(warm.lookup, CacheLookup::Hit);
+            for result in ["hit", "miss"] {
+                assert_eq!(
+                    lookup_metric_with_labels(
+                        &recorder,
+                        crate::db_cache::stats::ACCESS_COUNT,
+                        &[("entry_kind", label), ("result", result)]
+                    ),
+                    Some(1),
+                    "{label} {result}"
+                );
+            }
+        }
     }
 
     async fn fetch(

@@ -1,11 +1,10 @@
 // our microbenchmarks use pprof, but it doesn't work on windows
 #![cfg(not(windows))]
 
-//! Measures reads when every SST block is already in the block cache.
+//! Measures cached reads. `get_cold` disables cache admission to force misses.
 //!
-//! The data has 1,000 prefixes with 10 keys each and 100-byte values. Each
-//! bench runs against two databases: one with a single L0 SST, and one with
-//! 8 L0 SSTs. Every SST holds every key, so a scan reads from every SST.
+//! The data has 1,000 prefixes with 10 keys each and 100-byte values. Warm reads use one or eight
+//! L0 SSTs. The forced-miss case uses one. Every SST holds every key.
 //!
 //! - `scan_10_keys` scans one prefix.
 //! - `scan_1000_keys` scans 100 prefixes, which covers several blocks in each
@@ -73,12 +72,11 @@ fn scan_options() -> ScanOptions {
     }
 }
 
-/// Builds a DB with `num_ssts` L0 SSTs that each hold every key, then reads
-/// every block once so that all of them are cached.
-async fn build_db(path: &str, num_ssts: usize) -> Db {
+/// Build `num_ssts` L0 SSTs with the same keys. Scan the data to warm the supplied cache.
+async fn build_db(path: &str, num_ssts: usize, cache: Arc<SplitCache>) -> Db {
     let db = Db::builder(path, Arc::new(InMemory::new()))
         .with_settings(settings(num_ssts))
-        .with_db_cache(block_cache(), 0)
+        .with_db_cache(cache, 0)
         .build()
         .await
         .expect("failed to build db");
@@ -136,8 +134,22 @@ async fn scan(db: &Db, first: usize, num_prefixes: usize) -> usize {
 
 fn bench_sst_block_fetch(c: &mut Criterion) {
     let runtime = Runtime::new().expect("failed to create runtime");
-    let one_sst = runtime.block_on(build_db("/bench/one_sst", 1));
-    let eight_ssts = runtime.block_on(build_db("/bench/eight_ssts", 8));
+    let one_sst = runtime.block_on(build_db("/bench/one_sst", 1, block_cache()));
+    let eight_ssts = runtime.block_on(build_db("/bench/eight_ssts", 8, block_cache()));
+    let no_admission = Arc::new(FoyerCache::new_with_cache(
+        foyer::CacheBuilder::new(1024)
+            .with_filter(|_, _| false)
+            .build(),
+    ));
+    let cold = runtime.block_on(build_db(
+        "/bench/cold",
+        1,
+        Arc::new(
+            SplitCache::new()
+                .with_block_cache(Some(no_admission.clone()))
+                .with_meta_cache(Some(no_admission)),
+        ),
+    ));
     // Rotates through the prefixes, so that iterations read different blocks.
     let next_prefix = AtomicUsize::new(0);
     let next = |step: usize| next_prefix.fetch_add(step, Ordering::Relaxed) % NUM_PREFIXES;
@@ -163,9 +175,16 @@ fn bench_sst_block_fetch(c: &mut Criterion) {
         });
     }
 
+    group.bench_function("get_cold/1_sst", |b| {
+        b.to_async(&runtime).iter(|| async {
+            let value = cold.get(key(next(1), 0)).await.expect("get failed");
+            assert!(value.is_some());
+        });
+    });
     group.finish();
 
     runtime.block_on(async {
+        cold.close().await.expect("close failed");
         one_sst.close().await.expect("close failed");
         eight_ssts.close().await.expect("close failed");
     });
